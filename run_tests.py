@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import socket
+import json
+import os
+import sys
+
+def cmd(t, params=None):
+    s = socket.socket()
+    s.settimeout(20)
+    s.connect(('127.0.0.1', 9877))
+    msg = {'type': t, 'params': params if params is not None else {}}
+    s.send(json.dumps(msg).encode() + b'\n')
+    r = b''
+    while True:
+        try:
+            d = s.recv(8192)
+            if not d:
+                break
+            r += d
+            try:
+                json.loads(r.decode())
+                break
+            except json.JSONDecodeError:
+                continue
+        except socket.timeout:
+            break
+    s.close()
+    try:
+        return json.loads(r.decode().strip())
+    except json.JSONDecodeError:
+        return {'status': 'error', 'error': 'parse error: ' + r.decode()[:80]}
+
+passed = 0
+failed = 0
+failures = []
+
+def t(name, r):
+    global passed, failed
+    ok = r.get('status') == 'success'
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+        failures.append((name, str(r.get('error', ''))[:90]))
+    detail = str(r.get('results', '') if ok else r.get('error', ''))[:65]
+    print(f"  {'PASS' if ok else 'FAIL'} {name}: {detail}")
+    return r
+
+def chk(name, ok, detail=''):
+    """Assert an arbitrary boolean condition (beyond response status)."""
+    global passed, failed
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+        failures.append((name, str(detail)[:90]))
+    print(f"  {'PASS' if ok else 'FAIL'} {name}: {str(detail)[:65]}")
+    return ok
+
+# Setup
+r = cmd('new_canvas', {'width': 200, 'height': 200, 'fill': 'white'})
+img_id = r.get('image_id') or r.get('results', {}).get('image_id')
+print(f"Setup: {r.get('status')} img_id={img_id}")
+if r.get('status') != 'success':
+    print(f"Setup failed: {r.get('error', '')}", file=sys.stderr)
+    sys.exit(1)
+
+print()
+print("=== Cat 1: Info ===")
+t('get_gimp_info',    cmd('get_gimp_info'))
+t('list_images',      cmd('list_images', {}))
+t('get_metadata',     cmd('get_image_metadata'))
+t('list_layers',      cmd('list_layers', {'image_index': 0}))
+t('pixel_color',      cmd('get_pixel_color', {'image_index': 0, 'x': 10, 'y': 10}))
+t('get_histogram',    cmd('get_histogram', {'image_index': 0, 'channel': 'value'}))
+t('selection_bounds', cmd('get_selection_bounds', {'image_index': 0}))
+
+print()
+print("=== Cat 2: Adjustments ===")
+t('auto_levels',   cmd('auto_levels', {'image_index': 0}))
+t('adjust_curves', cmd('adjust_curves', {'image_index': 0, 'channel': 'value', 'points': [0,0,128,148,255,255]}))
+t('brightness',    cmd('adjust_brightness_contrast', {'image_index': 0, 'brightness': 10, 'contrast': 5}))
+t('hue_sat',       cmd('adjust_hue_saturation', {'image_index': 0, 'hue': 5, 'saturation': 10, 'lightness': 0}))
+t('color_balance', cmd('adjust_color_balance', {'image_index': 0, 'cyan_red': 10, 'magenta_green': 0, 'yellow_blue': -10}))
+t('sharpen',       cmd('sharpen',       {'image_index': 0, 'amount': 0.3}))
+t('blur',          cmd('blur',          {'image_index': 0, 'radius_x': 1.0, 'radius_y': 1.0}))
+t('denoise',       cmd('denoise',       {'image_index': 0}))
+t('desaturate',    cmd('desaturate',    {'image_index': 0}))
+t('invert',        cmd('invert_colors', {'image_index': 0}))
+
+print()
+print("=== Cat 3: Transform ===")
+t('scale_image',   cmd('scale_image',   {'image_index': 0, 'width': 150, 'height': 150}))
+t('scale_to_fit',  cmd('scale_to_fit',  {'image_index': 0, 'max_width': 120, 'max_height': 120}))
+t('crop_to_rect',  cmd('crop_to_rect',  {'image_index': 0, 'x': 0, 'y': 0, 'width': 100, 'height': 100}))
+t('rotate_image',  cmd('rotate_image',  {'image_index': 0, 'angle': 90}))
+t('flip_image',    cmd('flip_image',    {'image_index': 0, 'direction': 'horizontal'}))
+t('resize_canvas', cmd('resize_canvas', {'image_index': 0, 'width': 120, 'height': 120, 'offset_x': 0, 'offset_y': 0}))
+
+print()
+print("=== Cat 4: Selections ===")
+t('select_rect',    cmd('select_rectangle', {'image_index': 0, 'x': 10, 'y': 10, 'width': 40, 'height': 40}))
+t('select_ellipse', cmd('select_ellipse',   {'image_index': 0, 'x': 10, 'y': 10, 'width': 40, 'height': 40}))
+# Regression #23: select_by_color must actually create a selection, not
+# silently no-op while reporting success. Fill a known color and clear any
+# prior selection first, so a leftover selection can't mask a no-op.
+# Assert the setup itself succeeds so a broken fill can't skew the real check.
+t('select_setup_fill', cmd('fill_layer',  {'image_index': 0, 'color': '#ffffff'}))
+t('select_setup_none', cmd('select_none', {'image_index': 0}))
+t('select_color',   cmd('select_by_color',  {'image_index': 0, 'color': '#ffffff'}))
+_sel = cmd('get_selection_bounds', {'image_index': 0})
+chk('select_color_nonempty', _sel.get('results', {}).get('has_selection') is True, _sel.get('results'))
+t('select_all',     cmd('select_all',       {'image_index': 0}))
+t('select_none',    cmd('select_none',      {'image_index': 0}))
+t('invert_sel',     cmd('invert_selection', {'image_index': 0}))
+t('modify_sel',     cmd('modify_selection', {'image_index': 0, 'operation': 'grow', 'amount': 3}))
+
+print()
+print("=== Cat 5: Layers ===")
+t('create_layer',    cmd('create_layer',     {'image_index': 0, 'name': 'TLayer', 'width': 80, 'height': 80}))
+t('duplicate_layer', cmd('duplicate_layer',  {'image_index': 0}))
+t('list_layers2',    cmd('list_layers',      {'image_index': 0}))
+t('rename_layer',    cmd('rename_layer',     {'image_index': 0, 'new_name': 'Renamed'}))
+t('set_layer_props', cmd('set_layer_properties', {'image_index': 0, 'opacity': 80}))
+t('reorder_layer',   cmd('reorder_layer',    {'image_index': 0, 'layer_name': 'Renamed', 'new_position': 0}))
+t('delete_layer',    cmd('delete_layer',     {'image_index': 0, 'layer_name': 'Renamed'}))
+t('merge_visible',   cmd('merge_visible_layers', {'image_index': 0}))
+t('flatten_image',   cmd('flatten_image',    {'image_index': 0}))
+
+print()
+print("=== Cat 6: Drawing ===")
+t('fill_layer',     cmd('fill_layer',     {'image_index': 0, 'color': '#ff0000'}))
+t('set_colors',     cmd('set_colors',     {'foreground': '#000000', 'background': '#ffffff'}))
+t('fill_selection', cmd('fill_selection', {'image_index': 0, 'fill_type': 'foreground'}))
+t('draw_line',      cmd('draw_line',      {'image_index': 0, 'x1': 0, 'y1': 0, 'x2': 50, 'y2': 50, 'color': '#000000', 'width': 2}))
+t('draw_rect',      cmd('draw_rectangle', {'image_index': 0, 'x': 10, 'y': 10, 'width': 30, 'height': 30, 'color': '#0000ff', 'line_width': 2.0}))
+t('draw_ellipse',   cmd('draw_ellipse',   {'image_index': 0, 'x': 10, 'y': 10, 'width': 30, 'height': 30, 'color': '#00ff00', 'line_width': 2.0}))
+t('fill_rectangle', cmd('fill_rectangle', {'image_index': 0, 'x': 5, 'y': 5, 'width': 20, 'height': 20, 'color': '#ffff00'}))
+t('fill_ellipse',   cmd('fill_ellipse',   {'image_index': 0, 'x': 5, 'y': 5, 'width': 20, 'height': 20, 'color': '#ff00ff'}))
+t('gradient_fill',  cmd('gradient_fill',  {'image_index': 0, 'x1': 0, 'y1': 0, 'x2': 80, 'y2': 80}))
+# Regression: gradient_fill used to report success without drawing anything.
+_g_start = cmd('get_pixel_color', {'image_index': 0, 'x': 2, 'y': 2}).get('results', {}).get('color_hex')
+_g_end   = cmd('get_pixel_color', {'image_index': 0, 'x': 78, 'y': 78}).get('results', {}).get('color_hex')
+chk('gradient_fill_draws', _g_start is not None and _g_start != _g_end, f"{_g_start} -> {_g_end}")
+t('list_brushes',   cmd('list_brushes',   {}))
+t('paint_stroke',   cmd('paint_stroke',   {'image_index': 0, 'strokes': [{'points': [[10, 10], [40, 30], [70, 10]], 'color': '#000000', 'size': 6}]}))
+t('sample_color',   cmd('sample_color',   {'image_index': 0, 'x': 10, 'y': 10}))
+
+print()
+print("=== Cat 7: Text ===")
+t('add_text',   cmd('add_text',   {'image_index': 0, 'text': 'Hello', 'x': 10, 'y': 10, 'size': 12, 'color': '#000000'}))
+t('list_fonts', cmd('list_fonts', {}))
+
+print()
+print("=== Cat 8: Filters ===")
+t('gaussian_blur', cmd('apply_gaussian_blur', {'image_index': 0, 'radius': 2.0}))
+t('pixelate',      cmd('apply_pixelate',      {'image_index': 0, 'block_size': 5}))
+t('emboss',        cmd('apply_emboss',        {'image_index': 0}))
+t('vignette',      cmd('apply_vignette',      {'image_index': 0}))
+t('noise',         cmd('apply_noise',         {'image_index': 0}))
+t('drop_shadow',   cmd('apply_drop_shadow',   {'image_index': 0}))
+
+print()
+print("=== Regressions: check what the tool did, not only its status ===")
+t('reg_canvas', cmd('resize_canvas', {'image_index': 0, 'width': 120, 'height': 120, 'anchor': 'top-left'}))
+_count = cmd('list_layers', {'image_index': 0}).get('results', {}).get('count', 0)
+t('resize_canvas_fill', cmd('resize_canvas', {'image_index': 0, 'width': 140, 'height': 140, 'anchor': 'top-left', 'fill': '#0000ff'}))
+_layers = cmd('list_layers', {'image_index': 0}).get('results', {}).get('layers', [])
+chk('resize_canvas_keeps_layers', len(_layers) == _count + 1 and _layers[-1].get('name') == 'Canvas fill',
+    [lyr.get('name') for lyr in _layers])
+_corner = cmd('get_pixel_color', {'image_index': 0, 'x': 135, 'y': 135}).get('results', {}).get('color_hex')
+chk('resize_canvas_fills_new_area', _corner == '#0000ff', _corner)
+chk('list_layers_readable', all(not str(lyr.get('blend_mode')).isdigit() and len(lyr.get('offsets', [])) == 2 for lyr in _layers),
+    _layers[:1])
+
+t('reg_set_colors', cmd('set_colors', {'foreground': '#112233', 'background': '#445566'}))
+t('reg_drop_shadow', cmd('apply_drop_shadow', {'image_index': 0, 'color': '#ff00ff', 'blur_radius': 0}))
+_ctx = cmd('get_context_state').get('results', {})
+chk('drop_shadow_keeps_colors', _ctx.get('foreground_color', {}).get('hex') == '#112233'
+    and _ctx.get('background_color', {}).get('hex') == '#445566', _ctx.get('foreground_color'))
+
+cmd('select_rectangle', {'image_index': 0, 'x': 10, 'y': 10, 'width': 30, 'height': 30})
+t('reg_fill_rectangle', cmd('fill_rectangle', {'image_index': 0, 'x': 60, 'y': 60, 'width': 10, 'height': 10, 'color': '#00ff00'}))
+_sel = cmd('get_selection_bounds', {'image_index': 0}).get('results', {})
+chk('fill_rectangle_keeps_selection', _sel.get('has_selection') is True and _sel.get('x') == 10 and _sel.get('width') == 30, _sel)
+cmd('select_none', {'image_index': 0})
+
+t('reg_levels_layer', cmd('create_layer', {'image_index': 0, 'name': 'Levels', 'width': 140, 'height': 140}))
+cmd('fill_rectangle', {'image_index': 0, 'layer_name': 'Levels', 'x': 0, 'y': 0, 'width': 70, 'height': 140, 'color': '#606060'})
+cmd('fill_rectangle', {'image_index': 0, 'layer_name': 'Levels', 'x': 70, 'y': 0, 'width': 70, 'height': 140, 'color': '#a0a0a0'})
+t('reg_auto_levels', cmd('auto_levels', {'image_index': 0, 'layer_name': 'Levels'}))
+_lv = cmd('get_pixel_color', {'image_index': 0, 'layer_name': 'Levels', 'x': 10, 'y': 10, 'sample_merged': False}).get('results', {}).get('color_hex')
+chk('auto_levels_changes_pixels', _lv not in (None, '#606060'), _lv)
+
+_txt = t('reg_add_text', cmd('add_text', {'image_index': 0, 'text': 'Reg', 'x': 5, 'y': 5, 'size': 12, 'color': '#000000'}))
+_edit = t('reg_edit_text', cmd('edit_text', {'image_index': 0, 'layer_name': _txt.get('results', {}).get('layer_name'),
+                                              'size': 30, 'font': 'Serif'}))
+chk('edit_text_applies_size', _edit.get('results', {}).get('size') == 30, _edit.get('results'))
+
+_sheet = '/tmp/gimp_mcp_test_sheet.png'
+t('reg_sprite_sheet', cmd('export_sprite_sheet', {'image_index': 0, 'output_path': _sheet, 'columns': 2}))
+with open(_sheet, 'rb') if os.path.exists(_sheet) else open(os.devnull, 'rb') as _fh:
+    _png = _fh.read(26)
+chk('sprite_sheet_keeps_alpha', len(_png) == 26 and _png[25] == 6, _sheet)
+
+_warp = cmd('warp_region', {'image_index': 0, 'vectors': [{'x': 10, 'y': 10, 'dx': 5, 'dy': 0}]})
+chk('warp_region_refuses', _warp.get('status') == 'error', _warp.get('error'))
+
+t('reg_to_indexed', cmd('convert_color_mode', {'image_index': 0, 'mode': 'INDEXED', 'num_colors': 32}))
+chk('converted_to_indexed', 'Indexed' in json.dumps(cmd('get_image_metadata', {'image_index': 0}).get('results', {})), '')
+t('reg_back_to_rgb', cmd('convert_color_mode', {'image_index': 0, 'mode': 'RGB'}))
+
+print()
+print(f"=== TOTAL: {passed}/{passed+failed} PASSED ===")
+if failures:
+    print("Failures:")
+    for n, e in failures:
+        print(f"  {n}: {e}")
+
+sys.exit(1 if failures else 0)
